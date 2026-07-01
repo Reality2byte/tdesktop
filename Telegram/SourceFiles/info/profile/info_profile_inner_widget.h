@@ -7,8 +7,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "ui/rp_widget.h"
 #include "base/object_ptr.h"
+#include "info/profile/info_profile_section_stack.h"
+#include "ui/rp_widget.h"
 
 namespace Data {
 class ForumTopic;
@@ -37,7 +38,6 @@ namespace Profile {
 
 class Memento;
 class Members;
-class Cover;
 struct Origin;
 
 class InnerWidget final : public Ui::RpWidget {
@@ -47,11 +47,22 @@ public:
 		not_null<Controller*> controller,
 		Origin origin);
 
+	[[nodiscard]] rpl::producer<> backRequest() const;
+
 	void saveState(not_null<Memento*> memento);
 	void restoreState(not_null<Memento*> memento);
 
 	rpl::producer<Ui::ScrollToRequest> scrollToRequests() const;
 	rpl::producer<int> desiredHeightValue() const override;
+
+	bool hasFlexibleTopBar() const;
+	base::weak_qptr<Ui::RpWidget> createPinnedToTop(
+		not_null<Ui::RpWidget*> parent);
+	base::weak_qptr<Ui::RpWidget> createPinnedToBottom(
+		not_null<Ui::RpWidget*> parent);
+
+	void enableBackButton();
+	void showFinished();
 
 protected:
 	int resizeGetHeight(int newWidth) override;
@@ -63,8 +74,10 @@ private:
 	object_ptr<RpWidget> setupContent(
 		not_null<RpWidget*> parent,
 		Origin origin);
-	object_ptr<RpWidget> setupSharedMedia(not_null<RpWidget*> parent);
-	void setupMembers(not_null<Ui::VerticalLayout*> container);
+	object_ptr<Ui::SlideWrap<Ui::RpWidget>> setupSharedMedia(
+		not_null<RpWidget*> parent,
+		Ui::MultiSlideTracker &sharedTracker);
+	[[nodiscard]] Section makeMembersSection(not_null<QWidget*> parent);
 
 	int countDesiredHeight() const;
 	void updateDesiredHeight() {
@@ -77,18 +90,22 @@ private:
 	Data::ForumTopic * const _topic = nullptr;
 	Data::SavedSublist * const _sublist = nullptr;
 
-	PeerData *_reactionGroup = nullptr;
-
-	std::shared_ptr<Data::PhotoMedia> _nonPersonalView;
-
-	Members *_members = nullptr;
-	Cover *_cover = nullptr;
-	Ui::SlideWrap<RpWidget> *_sharedMediaWrap = nullptr;
-	object_ptr<RpWidget> _content;
-
 	bool _inResize = false;
 	rpl::event_stream<Ui::ScrollToRequest> _scrollToRequests;
 	rpl::event_stream<int> _desiredHeight;
+
+	rpl::variable<bool> _backToggles;
+	rpl::event_stream<> _backClicks;
+	rpl::event_stream<int> _onlineCount;
+	rpl::event_stream<> _showFinished;
+
+	std::shared_ptr<Data::PhotoMedia> _nonPersonalView;
+
+	rpl::variable<std::optional<QColor>> _topBarColor;
+
+	Members *_members = nullptr;
+	Ui::SlideWrap<RpWidget> *_sharedMediaWrap = nullptr;
+	object_ptr<RpWidget> _content;
 
 };
 

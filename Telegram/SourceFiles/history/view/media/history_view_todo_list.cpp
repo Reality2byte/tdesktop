@@ -17,6 +17,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "history/history_item_components.h"
 #include "history/view/history_view_message.h"
 #include "history/view/history_view_cursor_state.h"
+#include "history/view/history_view_text_helper.h"
 #include "calls/calls_instance.h"
 #include "ui/chat/message_bubble.h"
 #include "ui/chat/chat_style.h"
@@ -29,6 +30,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/effects/fireworks_animation.h"
 #include "ui/toast/toast.h"
 #include "ui/painter.h"
+#include "ui/power_saving.h"
 #include "data/data_media_types.h"
 #include "data/data_poll.h"
 #include "data/data_user.h"
@@ -40,26 +42,17 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "api/api_todo_lists.h"
 #include "window/window_peer_menu.h"
 #include "styles/style_chat.h"
+#include "styles/style_polls.h"
 #include "styles/style_widgets.h"
 #include "styles/style_window.h"
 
 namespace HistoryView {
-namespace {
-
-constexpr auto kShowRecentVotersCount = 3;
-constexpr auto kRotateSegments = 8;
-constexpr auto kRotateAmplitude = 3.;
-constexpr auto kScaleSegments = 2;
-constexpr auto kScaleAmplitude = 0.03;
-constexpr auto kLargestRadialDuration = 30 * crl::time(1000);
-constexpr auto kCriticalCloseDuration = 5 * crl::time(1000);
-
-} // namespace
 
 struct TodoList::Task {
 	Task();
 
 	void fillData(
+		not_null<Element*> view,
 		not_null<TodoListData*> todolist,
 		const TodoListItem &original,
 		Ui::Text::MarkedContext context);
@@ -82,6 +75,7 @@ TodoList::Task::Task()
 }
 
 void TodoList::Task::fillData(
+		not_null<Element*> view,
 		not_null<TodoListData*> todolist,
 		const TodoListItem &original,
 		Ui::Text::MarkedContext context) {
@@ -96,6 +90,7 @@ void TodoList::Task::fillData(
 		original.text,
 		Ui::WebpageTextTitleOptions(),
 		context);
+	InitElementTextPart(view, text);
 }
 
 void TodoList::Task::setCompletedBy(PeerData *by) {
@@ -268,14 +263,17 @@ void TodoList::updateTexts() {
 				.repaint = [=] { repaint(); },
 				.customEmojiLoopLimit = 2,
 			}));
+		InitElementTextPart(_parent, _title);
 	}
 	if (_flags != _todolist->flags() || _subtitle.isEmpty()) {
 		_flags = _todolist->flags();
 		_subtitle.setText(
 			st::msgDateTextStyle,
-			(_todolist->othersCanComplete()
-				? tr::lng_todo_title_group(tr::now)
-				: tr::lng_todo_title(tr::now)));
+			(!_todolist->othersCanComplete()
+				? tr::lng_todo_title(tr::now)
+				: _parent->data()->history()->peer->isUser()
+				? tr::lng_todo_title_user(tr::now)
+				: tr::lng_todo_title_group(tr::now)));
 	}
 	updateTasks(skipAnimations);
 }
@@ -297,7 +295,7 @@ void TodoList::updateTasks(bool skipAnimations) {
 		auto &&tasks = ranges::views::zip(_tasks, _todolist->items);
 		for (auto &&[task, original] : tasks) {
 			const auto wasDate = task.completionDate;
-			task.fillData(_todolist, original, context);
+			task.fillData(_parent, _todolist, original, context);
 			if (!skipAnimations && (!wasDate != !task.completionDate)) {
 				startToggleAnimation(task);
 				animated = true;
@@ -309,12 +307,13 @@ void TodoList::updateTasks(bool skipAnimations) {
 		}
 		return;
 	}
+	const auto has = hasHeavyPart();
 	_tasks = ranges::views::all(
 		_todolist->items
 	) | ranges::views::transform([&](const TodoListItem &item) {
 		auto result = Task();
 		result.id = item.id;
-		result.fillData(_todolist, item, context);
+		result.fillData(_parent, _todolist, item, context);
 		return result;
 	}) | ranges::to_vector;
 
@@ -323,14 +322,20 @@ void TodoList::updateTasks(bool skipAnimations) {
 	}
 
 	updateCompletionStatus();
+
+	if (has && !hasHeavyPart()) {
+		_parent->checkHeavyPart();
+	}
 }
 
 ClickHandlerPtr TodoList::createTaskClickHandler(
 		const Task &task) {
 	const auto id = task.id;
-	return std::make_shared<LambdaClickHandler>(crl::guard(this, [=] {
+	auto result = std::make_shared<LambdaClickHandler>(crl::guard(this, [=] {
 		toggleCompletion(id);
 	}));
+	result->setProperty(kTodoListItemIdProperty, id);
+	return result;
 }
 
 void TodoList::startToggleAnimation(Task &task) {
@@ -347,7 +352,7 @@ void TodoList::toggleCompletion(int id) {
 		return;
 	} else if (_parent->data()->Has<HistoryMessageForwarded>()) {
 		_parent->delegate()->elementShowTooltip(
-			tr::lng_todo_mark_forwarded(tr::now, Ui::Text::RichLangValue),
+			tr::lng_todo_mark_forwarded(tr::now, tr::rich),
 			[] {});
 		return;
 	} else if (!canComplete()) {
@@ -355,8 +360,8 @@ void TodoList::toggleCompletion(int id) {
 			tr::lng_todo_mark_restricted(
 				tr::now,
 				lt_user,
-				Ui::Text::Bold(_parent->data()->from()->shortName()),
-				Ui::Text::RichLangValue), [] {});
+				tr::bold(_parent->data()->from()->shortName()),
+				tr::rich), [] {});
 		return;
 	} else if (!_parent->history()->session().premium()) {
 		Window::PeerMenuTodoWantsPremium(Window::TodoWantsPremium::Mark);
@@ -369,11 +374,24 @@ void TodoList::toggleCompletion(int id) {
 	if (i == end(_tasks)) {
 		return;
 	}
+
 	const auto selected = (i->completionDate != 0);
 	i->completionDate = selected ? TimeId() : base::unixtime::now();
 	if (!selected) {
 		i->setCompletedBy(_parent->history()->session().user());
 	}
+
+	const auto parentMedia = _parent->data()->media();
+	const auto baseList = parentMedia ? parentMedia->todolist() : nullptr;
+	if (baseList) {
+		const auto j = ranges::find(baseList->items, id, &TodoListItem::id);
+		if (j != end(baseList->items)) {
+			j->completionDate = i->completionDate;
+			j->completedBy = i->completedBy;
+		}
+		history()->owner().updateDependentMessages(_parent->data());
+	}
+
 	startToggleAnimation(*i);
 	repaint();
 
@@ -386,7 +404,8 @@ void TodoList::toggleCompletion(int id) {
 }
 
 void TodoList::maybeStartFireworks() {
-	if (!ranges::contains(_tasks, TimeId(), &Task::completionDate)) {
+	if (!ranges::contains(_tasks, TimeId(), &Task::completionDate)
+		&& !_fireworksAnimation) {
 		_fireworksAnimation = std::make_unique<Ui::FireworksAnimation>(
 			[=] { repaint(); });
 	}
@@ -430,7 +449,16 @@ void TodoList::draw(Painter &p, const PaintContext &context) const {
 	paintw -= padding.left() + padding.right();
 
 	p.setPen(stm->historyTextFg);
-	_title.drawLeft(p, padding.left(), tshift, paintw, width(), style::al_left, 0, -1, context.selection);
+	_title.draw(p, {
+		.position = { padding.left(), tshift },
+		.availableWidth = paintw,
+		.palette = &stm->textPalette,
+		.spoiler = Ui::Text::DefaultSpoilerCache(),
+		.now = context.now,
+		.pausedEmoji = context.paused || On(PowerSaving::kEmojiChat),
+		.pausedSpoiler = context.paused || On(PowerSaving::kChatSpoiler),
+		.selection = context.selection,
+	});
 	tshift += _title.countHeight(paintw) + st::historyPollSubtitleSkip;
 
 	p.setPen(stm->msgDateFg);
@@ -452,6 +480,7 @@ void TodoList::draw(Painter &p, const PaintContext &context) const {
 			paintw,
 			width(),
 			context);
+		appendTaskHighlight(task.id, tshift, height, context);
 		if (was) {
 			heavy = true;
 		} else if (!task.userpic.null()) {
@@ -473,7 +502,7 @@ void TodoList::paintBottom(
 		const PaintContext &context) const {
 	const auto stringtop = top
 		+ st::msgPadding.bottom()
-		+ st::historyPollBottomButtonTop;
+		+ st::historyChecklistBottomTop;
 	const auto stm = context.messageStyle();
 
 	p.setPen(stm->msgDateFg);
@@ -525,7 +554,15 @@ int TodoList::paintTask(
 		? st::historyChecklistCheckedTop
 		: st::historyChecklistTaskPadding.top();
 	p.setPen(stm->historyTextFg);
-	task.text.drawLeft(p, aleft, top, awidth, outerWidth);
+	task.text.draw(p, {
+		.position = { aleft, top },
+		.availableWidth = awidth,
+		.palette = &stm->textPalette,
+		.spoiler = Ui::Text::DefaultSpoilerCache(),
+		.now = context.now,
+		.pausedEmoji = context.paused || On(PowerSaving::kEmojiChat),
+		.pausedSpoiler = context.paused || On(PowerSaving::kChatSpoiler),
+	});
 	if (task.completionDate) {
 		const auto nameTop = top
 			+ height
@@ -536,6 +573,33 @@ int TodoList::paintTask(
 		task.name.drawLeft(p, aleft, nameTop, awidth, outerWidth);
 	}
 	return height;
+}
+
+void TodoList::appendTaskHighlight(
+		int id,
+		int top,
+		int height,
+		const PaintContext &context) const {
+	if (context.highlight.todoItemId != id
+		|| context.highlight.collapsion <= 0.) {
+		return;
+	}
+	const auto to = context.highlightInterpolateTo;
+	const auto toProgress = (1. - context.highlight.collapsion);
+	if (toProgress >= 1.) {
+		context.highlightPathCache->addRect(to);
+	} else if (toProgress <= 0.) {
+		context.highlightPathCache->addRect(0, top, width(), height);
+	} else {
+		const auto lerp = [=](int from, int to) {
+			return from + (to - from) * toProgress;
+		};
+		context.highlightPathCache->addRect(
+			lerp(0, to.x()),
+			lerp(top, to.y()),
+			lerp(width(), to.width()),
+			lerp(height, to.height()));
+	}
 }
 
 void TodoList::paintRadio(
@@ -777,6 +841,17 @@ bool TodoList::hasHeavyPart() const {
 		}
 	}
 	return false;
+}
+
+void TodoList::hideSpoilers() {
+	if (_title.hasSpoilers()) {
+		_title.setSpoilerRevealed(false, anim::type::instant);
+	}
+	for (auto &task : _tasks) {
+		if (task.text.hasSpoilers()) {
+			task.text.setSpoilerRevealed(false, anim::type::instant);
+		}
+	}
 }
 
 std::vector<Media::TodoTaskInfo> TodoList::takeTasksInfo() {

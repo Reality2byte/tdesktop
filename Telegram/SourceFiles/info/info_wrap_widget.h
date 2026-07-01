@@ -53,6 +53,7 @@ enum class Wrap {
 	Narrow,
 	Side,
 	Search,
+	StoryAlbumEdit,
 };
 
 struct SelectedItem {
@@ -64,6 +65,7 @@ struct SelectedItem {
 	bool canForward = false;
 	bool canToggleStoryPin = false;
 	bool canUnpinStory = false;
+	bool storyInProfile = false;
 };
 
 struct SelectedItems {
@@ -79,7 +81,8 @@ enum class SelectionAction {
 	Forward,
 	Delete,
 	ToggleStoryPin,
-	ToggleStoryInProfile,
+	ToggleStoryToProfile,
+	ToggleStoryToArchive,
 };
 
 class WrapWidget final : public Window::SectionWidget {
@@ -114,8 +117,11 @@ public:
 		not_null<Window::SectionMemento*> memento,
 		const Window::SectionShow &params) override;
 	bool showBackFromStackInternal(const Window::SectionShow &params);
+	bool closeByBackButton();
 	void removeFromStack(const std::vector<Section> &sections);
 	std::shared_ptr<Window::SectionMemento> createMemento() override;
+	[[nodiscard]] SendMenu::Details sendMenuDetails() const override;
+	bool processChosenSticker(ChatHelpers::FileChosen &&chosen) override;
 
 	rpl::producer<int> desiredHeightValue() const override;
 
@@ -142,6 +148,8 @@ public:
 	[[nodiscard]] rpl::producer<> removeRequests() const override {
 		return _removeRequests.events();
 	}
+
+	[[nodiscard]] rpl::producer<SelectedItems> selectedListValue() const;
 
 	void replaceSwipeHandler(Ui::Controls::SwipeHandlerArgs *incompleteArgs);
 
@@ -206,7 +214,6 @@ private:
 		not_null<Window::SessionController*> window,
 		not_null<ContentMemento*> memento);
 
-	rpl::producer<SelectedItems> selectedListValue() const;
 	bool requireTopBarSearch() const;
 
 	void addTopBarMenuButton();
@@ -225,7 +232,6 @@ private:
 	object_ptr<TopBar> _topBar = { nullptr };
 	object_ptr<Ui::RpWidget> _topBarSurrogate = { nullptr };
 	Ui::Animations::Simple _topBarOverrideAnimation;
-	bool _topBarOverrideShown = false;
 
 	object_ptr<Ui::FadeShadow> _topShadow;
 	object_ptr<Ui::FadeShadow> _bottomShadow;

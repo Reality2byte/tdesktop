@@ -9,6 +9,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "api/api_credits.h"
 #include "api/api_statistics.h"
+#include "boxes/peers/replace_boost_box.h" // GenerateGiftUniqueUserpicCallback
 #include "boxes/peer_list_controllers.h"
 #include "boxes/peer_list_widgets.h"
 #include "info/channel_statistics/earn/earn_icons.h"
@@ -35,6 +36,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/painter.h"
 #include "ui/rect.h"
 #include "ui/text/format_values.h"
+#include "ui/text/text_custom_emoji.h"
 #include "ui/text/text_utilities.h"
 #include "ui/vertical_list.h"
 #include "ui/widgets/buttons.h"
@@ -64,7 +66,8 @@ using BoostCallback = Fn<void(const Data::Boost &)>;
 		+ (entry.refunded ? '1' : '0')
 		+ (entry.pending ? '1' : '0')
 		+ (entry.failed ? '1' : '0')
-		+ (entry.in ? '1' : '0'));
+		+ (entry.in ? '1' : '0')
+		+ (entry.giftOffer ? '1' : '0'));
 }
 
 void AddSubtitle(
@@ -458,6 +461,17 @@ public:
 		int outerWidth,
 		bool selected) override;
 
+	int paintNameIconGetLeadingWidth(
+		Painter &p,
+		Fn<void()> repaint,
+		crl::time now,
+		int nameLeft,
+		int nameTop,
+		int outerWidth,
+		bool selected) override {
+		return 0;
+	}
+
 	QSize rightActionSize() const override;
 	QMargins rightActionMargins() const override;
 	bool rightActionDisabled() const override;
@@ -484,7 +498,7 @@ private:
 BoostRow::BoostRow(not_null<PeerData*> peer, const Data::Boost &boost)
 : PeerListRow(peer, UniqueRowIdFromString(boost.id))
 , _boost(boost)
-, _userpic(Ui::EmptyUserpic::UserpicColor(0), QString()) {
+, _userpic(Ui::EmptyUserpic::UserpicColor(st::colorIndexRed), QString()) {
 	init();
 }
 
@@ -882,14 +896,15 @@ void CreditsRow::init() {
 	const auto name = !isSpecial
 		? PeerListRow::generateName()
 		: Ui::GenerateEntryName(_entry).text;
-	_name = _entry.paidMessagesCount
-		? tr::lng_credits_paid_messages_fee(
-			tr::now,
-			lt_count,
-			_entry.paidMessagesCount)
+	_name = (_entry.isLiveStoryReaction() || _entry.paidMessagesCount)
+		? name
+		: _entry.postsSearch
+		? tr::lng_credits_box_history_entry_posts_search(tr::now)
+		: (_entry.giftUpgraded && _entry.uniqueGift && !isSpecial)
+		? u"%1 #%2"_q.arg(_entry.uniqueGift->title).arg(Lang::FormatCountDecimal(_entry.uniqueGift->number))
 		: ((!_entry.subscriptionUntil.isNull() && !isSpecial)
-			|| (_entry.giftUpgraded && !isSpecial)
 			|| (_entry.giftResale && !isSpecial)
+			|| (_entry.giftOffer && !isSpecial)
 			|| _entry.title.isEmpty())
 		? name
 		: _entry.title;
@@ -899,8 +914,13 @@ void CreditsRow::init() {
 			tr::now,
 			lt_count_decimal,
 			_entry.floodSkip)
+		: _entry.isLiveStoryReaction()
+		? tr::lng_credits_paid_messages_fee_live_reaction(tr::now)
 		: _entry.paidMessagesCount
-		? name
+		? tr::lng_credits_paid_messages_fee(
+			tr::now,
+			lt_count,
+			_entry.paidMessagesCount)
 		: (!_entry.subscriptionUntil.isNull() && !_entry.title.isEmpty())
 		? _entry.title
 		: _entry.refunded
@@ -918,6 +938,8 @@ void CreditsRow::init() {
 		? tr::lng_credits_box_history_entry_fragment(tr::now)
 		: (_entry.gift && isSpecial)
 		? tr::lng_credits_box_history_entry_anonymous(tr::now)
+		: _entry.giftUpgraded
+		? tr::lng_credits_box_history_entry_gift_upgrade(tr::now)
 		: (_name == name)
 		? Ui::GenerateEntryName(_entry).text
 		: name;
@@ -934,7 +956,7 @@ void CreditsRow::init() {
 				langDayOfMonthFull(_subscription.until.date())));
 		_description.setText(st::defaultTextStyle, _subscription.title);
 	}
-	if (_entry.bareGiftStickerId) {
+	if (_entry.bareGiftStickerId && !_entry.giftUpgraded) {
 		_description.setMarkedText(
 			st::defaultTextStyle,
 			Ui::Text::SingleCustomEmoji(
@@ -974,7 +996,7 @@ void CreditsRow::init() {
 			TextWithEntities()
 				.append(_entry.in ? QChar('+') : kMinus)
 				.append(isCurrency
-					? Info::ChannelEarn::MajorPart(_entry.credits)
+					? Info::ChannelEarn::MajorPart(_entry.credits.abs())
 					: Lang::FormatCreditsAmountDecimal(_entry.credits.abs()))
 				.append(QChar(' '))
 				.append(isCurrency
@@ -997,14 +1019,14 @@ void CreditsRow::init() {
 		}
 	}
 	if (!_paintUserpicCallback) {
-		_paintUserpicCallback = /*_entry.stargift
-			? Ui::GenerateGiftStickerUserpicCallback(
+		_paintUserpicCallback = _entry.giftUpgraded
+			? GenerateGiftUniqueUserpicCallback(
 				_session,
-				_entry.bareGiftStickerId,
+				_entry.uniqueGift,
 				_context.repaint)
-			: */!isSpecial
-			? PeerListRow::generatePaintUserpicCallback(false)
-			: Ui::GenerateCreditsPaintUserpicCallback(_entry);
+			: (isSpecial || _entry.postsSearch)
+			? Ui::GenerateCreditsPaintUserpicCallback(_entry)
+			: PeerListRow::generatePaintUserpicCallback(false);
 	}
 }
 
@@ -1161,6 +1183,9 @@ const style::PeerListItem &CreditsRow::computeSt(
 		: st::boostsListBox.item;
 }
 
+constexpr auto kCreditsAutoLoadThreshold = 100;
+constexpr auto kCreditsAutoLoadBatchSize = 20;
+
 class CreditsController final : public PeerListController {
 public:
 	explicit CreditsController(CreditsDescriptor d);
@@ -1171,11 +1196,17 @@ public:
 	void loadMoreRows() override;
 
 	[[nodiscard]] bool skipRequest() const;
-	void requestNext();
+	void requestNext(int limit = 0);
 
-	[[nodiscard]] rpl::producer<bool> allLoadedValue() const;
+	[[nodiscard]] rpl::producer<bool> showMoreShownValue() const;
 
 private:
+	struct IconCache {
+		QImage credits;
+		QImage tonIn;
+		QImage tonOut;
+	};
+
 	void applySlice(const Data::CreditsStatusSlice &slice);
 
 	const not_null<Main::Session*> _session;
@@ -1185,11 +1216,13 @@ private:
 	Api::CreditsHistory _api;
 	Data::CreditsStatusSlice _firstSlice;
 	Data::CreditsStatusSlice::OffsetToken _apiToken;
+	IconCache _iconCache;
 	Ui::Text::MarkedContext _context;
 
 	base::flat_map<PeerListRowId, not_null<PeerListRow*>> _rowsById;
 
 	rpl::variable<bool> _allLoaded = false;
+	rpl::variable<int> _loadedCount = 0;
 	bool _requesting = false;
 
 };
@@ -1208,20 +1241,29 @@ CreditsController::CreditsController(CreditsDescriptor d)
 			const Ui::Text::MarkedContext &context
 		) -> std::unique_ptr<Ui::Text::CustomEmoji> {
 		if (data == Ui::kCreditsCurrency) {
-			return std::make_unique<Ui::Text::ShiftedEmoji>(
-				Ui::MakeCreditsIconEmoji(height, 1),
+			if (_iconCache.credits.isNull()) {
+				_iconCache.credits = Ui::GenerateStars(height, 1);
+			}
+			return MakeWrappedEmoji<Ui::Text::ShiftedEmoji>(
+				std::make_unique<Ui::CustomEmoji::Internal>(
+					u"credits_icon:%1:1"_q.arg(height),
+					_iconCache.credits),
 				QPoint(-st::lineWidth, st::lineWidth));
 		}
 		if (data.startsWith(u"ton"_q)) {
 			const auto in = data.split(u":"_q)[1].startsWith(u"in"_q);
-			return std::make_unique<Ui::Text::ShiftedEmoji>(
-				std::make_unique<Ui::Text::StaticCustomEmoji>(
-					Ui::Earn::IconCurrencyColored(
-						st::tonFieldIconSize,
-						in
-							? st::boxTextFgGood->c
-							: st::menuIconAttentionColor->c),
-					data.toString()),
+			auto &slot = in ? _iconCache.tonIn : _iconCache.tonOut;
+			if (slot.isNull()) {
+				slot = Ui::Earn::IconCurrencyColored(
+					st::tonFieldIconSize,
+					(in
+						? st::boxTextFgGood->c
+						: st::menuIconAttentionColor->c));
+			}
+			return MakeWrappedEmoji<Ui::Text::ShiftedEmoji>(
+				std::make_unique<Ui::CustomEmoji::Internal>(
+					data.toString(),
+					slot),
 				QPoint(0, st::lineWidth));
 		}
 		const auto desc = DeserializeCreditsRowDescriptionData(
@@ -1251,7 +1293,7 @@ bool CreditsController::skipRequest() const {
 	return _requesting || _allLoaded.current();
 }
 
-void CreditsController::requestNext() {
+void CreditsController::requestNext(int limit) {
 	_requesting = true;
 	const auto done = [=](const Data::CreditsStatusSlice &s) {
 		_requesting = false;
@@ -1260,7 +1302,7 @@ void CreditsController::requestNext() {
 	if (_subscription) {
 		return _api.requestSubscriptions(_apiToken, done);
 	}
-	_api.request(_apiToken, done);
+	_api.request(_apiToken, done, limit);
 }
 
 void CreditsController::prepare() {
@@ -1269,11 +1311,20 @@ void CreditsController::prepare() {
 }
 
 void CreditsController::loadMoreRows() {
+	if (_subscription
+		|| skipRequest()
+		|| _loadedCount.current() >= kCreditsAutoLoadThreshold) {
+		return;
+	}
+	requestNext(kCreditsAutoLoadBatchSize);
 }
 
 void CreditsController::applySlice(const Data::CreditsStatusSlice &slice) {
 	_allLoaded = slice.allLoaded;
 	_apiToken = _subscription ? slice.tokenSubscriptions : slice.token;
+	_loadedCount = _loadedCount.current()
+		+ int(slice.list.size())
+		+ int(slice.subscriptions.size());
 
 	auto create = [&](
 			const Data::CreditsHistoryEntry &i,
@@ -1326,8 +1377,16 @@ void CreditsController::rowClicked(not_null<PeerListRow*> row) {
 	}
 }
 
-rpl::producer<bool> CreditsController::allLoadedValue() const {
-	return _allLoaded.value();
+rpl::producer<bool> CreditsController::showMoreShownValue() const {
+	if (_subscription) {
+		return _allLoaded.value() | rpl::map(!rpl::mappers::_1);
+	}
+	return rpl::combine(
+		_allLoaded.value(),
+		_loadedCount.value()
+	) | rpl::map([](bool allLoaded, int count) {
+		return !allLoaded && (count >= kCreditsAutoLoadThreshold);
+	});
 }
 
 } // namespace
@@ -1514,7 +1573,7 @@ void AddCreditsHistoryList(
 		}
 	};
 	wrap->toggleOn(
-		state->controller.allLoadedValue() | rpl::map(!rpl::mappers::_1),
+		state->controller.showMoreShownValue(),
 		anim::type::instant);
 	wrap->entity()->setClickedCallback(showMore);
 }

@@ -9,6 +9,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "history/history_item_reply_markup.h"
 
+#include <memory>
+
+namespace Iv {
+struct RichPage;
+} // namespace Iv
+
 namespace Main {
 class Session;
 } // namespace Main
@@ -21,7 +27,8 @@ struct HistoryMessageEdition {
 
 	bool isEditHide = false;
 	bool isMediaUnread = false;
-	int editDate = 0;
+	TimeId repeatPeriod = 0;
+	TimeId editDate = 0;
 	int views = -1;
 	int forwards = -1;
 	int ttl = 0;
@@ -37,7 +44,9 @@ struct HistoryMessageEdition {
 	HistoryMessageMarkupData replyMarkup;
 	HistoryMessageRepliesData replies;
 	HistoryMessageSuggestInfo suggest;
+	std::shared_ptr<const Iv::RichPage> richPage;
 	const MTPMessageMedia *mtpMedia = nullptr;
 	const MTPMessageReactions *mtpReactions = nullptr;
 	const MTPFactCheck *mtpFactcheck = nullptr;
+	QString fromRank;
 };

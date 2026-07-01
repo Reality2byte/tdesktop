@@ -14,7 +14,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "platform/platform_specific.h"
 #include "core/application.h"
 #include "core/sandbox.h"
-#include "core/core_settings.h"
+#include "core/version.h"
 #include "data/data_forum_topic.h"
 #include "data/data_saved_sublist.h"
 #include "data/data_peer.h"
@@ -57,14 +57,20 @@ bool ServiceRegistered = false;
 ServerInformation CurrentServerInformation;
 std::vector<std::string> CurrentCapabilities;
 
+[[nodiscard]] const auto &OptionGNotification() {
+	static const auto &result = base::options::lookup<bool>(
+		Window::Notifications::kOptionGNotification);
+	return result;
+}
+
 [[nodiscard]] bool HasCapability(const char *value) {
 	return ranges::contains(CurrentCapabilities, value);
 }
 
-std::unique_ptr<base::Platform::DBus::ServiceWatcher> CreateServiceWatcher() {
+std::optional<base::Platform::DBus::ServiceWatcher> CreateServiceWatcher() {
 	auto connection = Gio::bus_get_sync(Gio::BusType::SESSION_, nullptr);
 	if (!connection) {
-		return nullptr;
+		return {};
 	}
 
 	const auto activatable = [&] {
@@ -79,7 +85,7 @@ std::unique_ptr<base::Platform::DBus::ServiceWatcher> CreateServiceWatcher() {
 		return ranges::contains(*names, kService);
 	}();
 
-	return std::make_unique<base::Platform::DBus::ServiceWatcher>(
+	return std::make_optional<base::Platform::DBus::ServiceWatcher>(
 		connection.gobj_(),
 		kService,
 		[=](
@@ -137,7 +143,7 @@ bool UseGNotification() {
 		return false;
 	}
 
-	if (Window::Notifications::OptionGNotification.value()) {
+	if (OptionGNotification().value()) {
 		return true;
 	}
 
@@ -207,8 +213,7 @@ bool Enforced() {
 	// Wayland doesn't support positioning
 	// and custom notifications don't work here
 	return IsWayland()
-		|| (Gio::Application::get_default()
-			&& Window::Notifications::OptionGNotification.value());
+		|| (Gio::Application::get_default() && OptionGNotification().value());
 }
 
 bool ByDefault() {
@@ -233,15 +238,21 @@ bool ByDefault() {
 	}, HasCapability);
 }
 
+bool VolumeSupported() {
+	return UseGNotification() || !HasCapability("sound");
+}
+
 void Create(Window::Notifications::System *system) {
 	static const auto ServiceWatcher = CreateServiceWatcher();
 
 	const auto managerSetter = [=](
 			XdgNotifications::NotificationsProxy proxy) {
-		system->setManager([=] {
-			auto manager = std::make_unique<Manager>(system);
-			manager->_private->init(proxy);
-			return manager;
+		Core::Sandbox::Instance().customEnterFromEventLoop([&] {
+			system->setManager([=] {
+				auto manager = std::make_unique<Manager>(system);
+				manager->_private->init(proxy);
+				return manager;
+			});
 		});
 	};
 
@@ -258,27 +269,26 @@ void Create(Window::Notifications::System *system) {
 		kService,
 		kObjectPath,
 		[=](GObject::Object, Gio::AsyncResult res) {
-			auto proxy =
-				XdgNotifications::NotificationsProxy::new_for_bus_finish(
-					res,
-					nullptr);
+			auto result =
+				XdgNotifications::NotificationsProxy::new_for_bus_finish(res);
 
-			if (!proxy) {
+			if (result) {
+				ServiceRegistered = bool(result->get_name_owner());
+			} else {
+				Gio::DBusErrorNS_::strip_remote_error(result.error());
+				LOG(("Native Notification Error: %1").arg(
+					result.error().message_().c_str()));
 				ServiceRegistered = false;
-				CurrentServerInformation = {};
-				CurrentCapabilities = {};
-				managerSetter(nullptr);
-				return;
 			}
 
-			ServiceRegistered = bool(proxy.get_name_owner());
 			if (!ServiceRegistered) {
 				CurrentServerInformation = {};
 				CurrentCapabilities = {};
-				managerSetter(proxy);
+				managerSetter({});
 				return;
 			}
 
+			auto proxy = *result;
 			auto interface = XdgNotifications::Notifications(proxy);
 
 			interface.call_get_server_information([=](
@@ -327,9 +337,7 @@ void Create(Window::Notifications::System *system) {
 
 Manager::Private::Private(not_null<Manager*> manager)
 : _manager(manager)
-, _application(UseGNotification()
-		? Gio::Application::get_default()
-		: nullptr)
+, _application(Gio::Application::get_default())
 , _sounds(cWorkingDir() + u"tdata/audio_cache"_q) {
 	const auto &serverInformation = CurrentServerInformation;
 
@@ -378,12 +386,19 @@ Manager::Private::Private(not_null<Manager*> manager)
 			};
 		};
 
-		auto activate = gi::wrap(
-			G_SIMPLE_ACTION(
-				actionMap.lookup_action("notification-activate").gobj_()),
-			gi::transfer_none);
+		const auto notificationIdVariantType = GLib::VariantType::new_(
+			"a{sv}");
 
-		const auto activateSig = activate.signal_activate().connect([=](
+		auto activate = Gio::SimpleAction::new_(
+			"notification-activate",
+			notificationIdVariantType);
+
+		actionMap.add_action(activate);
+		_lifetime.add([=]() mutable {
+			actionMap.remove_action("notification-activate");
+		});
+
+		activate.signal_activate().connect([=](
 				Gio::SimpleAction,
 				GLib::Variant parameter) {
 			Core::Sandbox::Instance().customEnterFromEventLoop([&] {
@@ -392,16 +407,16 @@ Manager::Private::Private(not_null<Manager*> manager)
 			});
 		});
 
+		auto markAsRead = Gio::SimpleAction::new_(
+			"notification-mark-as-read",
+			notificationIdVariantType);
+
+		actionMap.add_action(markAsRead);
 		_lifetime.add([=]() mutable {
-			activate.disconnect(activateSig);
+			actionMap.remove_action("notification-mark-as-read");
 		});
 
-		auto markAsRead = gi::wrap(
-			G_SIMPLE_ACTION(
-				actionMap.lookup_action("notification-mark-as-read").gobj_()),
-			gi::transfer_none);
-
-		const auto markAsReadSig = markAsRead.signal_activate().connect([=](
+		markAsRead.signal_activate().connect([=](
 				Gio::SimpleAction,
 				GLib::Variant parameter) {
 			Core::Sandbox::Instance().customEnterFromEventLoop([&] {
@@ -410,10 +425,6 @@ Manager::Private::Private(not_null<Manager*> manager)
 					{});
 			});
 		});
-
-		_lifetime.add([=]() mutable {
-			markAsRead.disconnect(markAsReadSig);
-		});
 	}
 }
 
@@ -421,19 +432,19 @@ void Manager::Private::init(XdgNotifications::NotificationsProxy proxy) {
 	_proxy = proxy;
 	_interface = proxy;
 
-	if (_application || !_interface) {
+	if (!_interface) {
 		return;
 	}
 
-	const auto actionInvoked = _interface.signal_action_invoked().connect([=](
+	_interface.signal_action_invoked().connect([=](
 			XdgNotifications::Notifications,
 			uint id,
 			std::string actionName) {
 		Core::Sandbox::Instance().customEnterFromEventLoop([&] {
 			for (const auto &[key, notifications] : _notifications) {
 				for (const auto &[msgId, notification] : notifications) {
-					const auto &nid = notification->id;
-					if (v::is<uint>(nid) && v::get<uint>(nid) == id) {
+					const auto nid = std::get_if<uint>(&notification->id);
+					if (nid && id == *nid) {
 						if (actionName == "default") {
 							_manager->notificationActivated({ key, msgId });
 						} else if (actionName == "mail-mark-read") {
@@ -446,19 +457,15 @@ void Manager::Private::init(XdgNotifications::NotificationsProxy proxy) {
 		});
 	});
 
-	_lifetime.add([=] {
-		_interface.disconnect(actionInvoked);
-	});
-
-	const auto replied = _interface.signal_notification_replied().connect([=](
+	_interface.signal_notification_replied().connect([=](
 			XdgNotifications::Notifications,
 			uint id,
 			std::string text) {
 		Core::Sandbox::Instance().customEnterFromEventLoop([&] {
 			for (const auto &[key, notifications] : _notifications) {
 				for (const auto &[msgId, notification] : notifications) {
-					const auto &nid = notification->id;
-					if (v::is<uint>(nid) && v::get<uint>(nid) == id) {
+					const auto nid = std::get_if<uint>(&notification->id);
+					if (nid && id == *nid) {
 						_manager->notificationReplied(
 							{ key, msgId },
 							{ QString::fromStdString(text), {} });
@@ -469,18 +476,14 @@ void Manager::Private::init(XdgNotifications::NotificationsProxy proxy) {
 		});
 	});
 
-	_lifetime.add([=] {
-		_interface.disconnect(replied);
-	});
-
-	const auto tokenSignal = _interface.signal_activation_token().connect([=](
+	_interface.signal_activation_token().connect([=](
 			XdgNotifications::Notifications,
 			uint id,
 			std::string token) {
 		for (const auto &[key, notifications] : _notifications) {
 			for (const auto &[msgId, notification] : notifications) {
-				const auto &nid = notification->id;
-				if (v::is<uint>(nid) && v::get<uint>(nid) == id) {
+				const auto nid = std::get_if<uint>(&notification->id);
+				if (nid && id == *nid) {
 					GLib::setenv("XDG_ACTIVATION_TOKEN", token, true);
 					return;
 				}
@@ -488,11 +491,7 @@ void Manager::Private::init(XdgNotifications::NotificationsProxy proxy) {
 		}
 	});
 
-	_lifetime.add([=] {
-		_interface.disconnect(tokenSignal);
-	});
-
-	const auto closed = _interface.signal_notification_closed().connect([=](
+	_interface.signal_notification_closed().connect([=](
 			XdgNotifications::Notifications,
 			uint id,
 			uint reason) {
@@ -513,18 +512,14 @@ void Manager::Private::init(XdgNotifications::NotificationsProxy proxy) {
 					* In all other cases we keep the notification reference so that we may clear the notification later from history,
 					* if the message for that notification is read (e.g. chat is opened or read from another device).
 					*/
-					const auto &nid = notification->id;
-					if (v::is<uint>(nid) && v::get<uint>(nid) == id && reason == 2) {
+					const auto nid = std::get_if<uint>(&notification->id);
+					if (nid && id == *nid && reason == 2) {
 						clearNotification({ key, msgId });
 						return;
 					}
 				}
 			}
 		});
-	});
-
-	_lifetime.add([=] {
-		_interface.disconnect(closed);
 	});
 }
 
@@ -543,7 +538,7 @@ void Manager::Private::showNotification(
 		.contextId = key,
 		.msgId = info.itemId,
 	};
-	auto notification = _application
+	auto notification = UseGNotification()
 		? Gio::Notification::new_(info.title.toStdString())
 		: Gio::Notification();
 
@@ -927,11 +922,7 @@ bool Manager::doSkipToast() const {
 }
 
 void Manager::doMaybePlaySound(Fn<void()> playSound) {
-	if (UseGNotification()
-		|| !HasCapability("sound")
-		|| !Core::App().settings().desktopNotify()) {
-		_private->invokeIfNotInhibited(std::move(playSound));
-	}
+	_private->invokeIfNotInhibited(std::move(playSound));
 }
 
 void Manager::doMaybeFlashBounce(Fn<void()> flashBounce) {

@@ -18,6 +18,7 @@ namespace {
 
 using Type = MiniStarsType;
 constexpr auto kDeformationMax = 0.1;
+constexpr auto kIdleLimit = 5;
 
 } // namespace
 
@@ -39,7 +40,9 @@ MiniStars::MiniStars(
 , _deathTime((type != Type::SlowStars && type != Type::SlowDiamondStars)
 	? Interval{ 1500, 2000 }
 	: Interval{ 1500 * 2, 2000 * 2 })
-, _size({ 5, 10 })
+, _size((type != Type::SlowStars)
+	? Interval{ 5, 10 }
+	: Interval{ 2, 4 })
 , _alpha({ opaque ? 100 : 40, opaque ? 100 : 60 })
 , _sinFactor({ 10, 190 })
 , _spritesCount({ 0, ((type == Type::MonoStars) ? 1 : 2) })
@@ -53,6 +56,10 @@ MiniStars::MiniStars(
 	? u":/gui/icons/settings/starmini.svg"_q
 	: u":/gui/icons/settings/star.svg"_q)
 , _animation([=](crl::time now) {
+	if (++_idleCounter >= kIdleLimit) {
+		_animation.stop();
+		return;
+	}
 	if (now > _nextBirthTime && !_paused) {
 		createStar(now);
 	}
@@ -73,8 +80,6 @@ MiniStars::MiniStars(
 			createStar(i);
 		}
 		updateCallback(_rectToUpdate);
-	} else {
-		_animation.start();
 	}
 }
 
@@ -89,6 +94,10 @@ crl::time MiniStars::timeNow() const {
 }
 
 void MiniStars::paint(QPainter &p, const QRectF &rect) {
+	_idleCounter = 0;
+	if (!_animation.animating()) {
+		_animation.start();
+	}
 	const auto center = rect.center();
 	const auto opacity = p.opacity();
 	const auto now = timeNow();

@@ -12,14 +12,14 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/platform/base_platform_info.h"
 #include "base/platform/linux/base_linux_dbus_utilities.h"
 #include "base/platform/linux/base_linux_xdp_utilities.h"
+#include "base/platform/linux/base_linux_app_launch_context.h"
 #include "lang/lang_keys.h"
-#include "mainwindow.h"
-#include "storage/localstorage.h"
 #include "core/launcher.h"
 #include "core/sandbox.h"
 #include "core/application.h"
-#include "core/core_settings.h"
 #include "core/update_checker.h"
+#include "core/version.h"
+#include "data/data_location.h"
 #include "window/window_controller.h"
 #include "webview/platform/linux/webview_linux_webkitgtk.h"
 
@@ -29,6 +29,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QSystemTrayIcon>
+#include <QtGui/QDesktopServices>
 #include <QtCore/QStandardPaths>
 #include <QtCore/QProcess>
 
@@ -37,6 +38,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include <xdgdbus/xdgdbus.hpp>
 #include <xdpbackground/xdpbackground.hpp>
+#include <xdpopenuri/xdpopenuri.hpp>
 #include <xdprequest/xdprequest.hpp>
 
 #include <sys/stat.h>
@@ -46,8 +48,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <unistd.h>
 #include <dirent.h>
 #include <pwd.h>
-
-#include <iostream>
 
 namespace {
 
@@ -471,7 +471,10 @@ void InstallLauncher() {
 		"DESKTOPINTEGRATION");
 
 	// don't update desktop file for alpha version or if updater is disabled
-	if (cAlphaVersion() || Core::UpdaterDisabled() || DisabledByEnv) {
+	if (cAlphaVersion()
+			|| Core::UpdaterDisabled()
+			|| KSandbox::isInside()
+			|| DisabledByEnv) {
 		return;
 	}
 
@@ -527,6 +530,55 @@ void InstallLauncher() {
 		reinterpret_cast<const char*>(binary.data()),
 		binary.size()).toBase64(QByteArray::Base64UrlEncoding);
 	return base64.mid(0, kHashForSocketPathLength);
+}
+
+void AppInfoCheckScheme(
+		const std::string &scheme,
+		Fn<void(Gio::AppInfo, Fn<void()>)> callback,
+		Fn<void()> fail) {
+	// TODO: use get_default_for_uri_scheme_async once we can use GLib 2.74
+	if (auto appInfo = Gio::AppInfo::get_default_for_uri_scheme(scheme)) {
+		callback(appInfo, fail);
+		return;
+	}
+	fail();
+}
+
+void PortalCheckScheme(
+		const std::string &scheme,
+		Fn<void(Fn<void()>)> callback,
+		Fn<void()> fail) {
+	XdpOpenURI::OpenURIProxy::new_for_bus(
+		Gio::BusType::SESSION_,
+		Gio::DBusProxyFlags::NONE_,
+		base::Platform::XDP::kService,
+		base::Platform::XDP::kObjectPath,
+		[=](GObject::Object, Gio::AsyncResult res) {
+			auto interface = XdpOpenURI::OpenURI(
+				XdpOpenURI::OpenURIProxy::new_for_bus_finish(res, nullptr));
+
+			if (!interface) {
+				fail();
+				return;
+			}
+
+			interface.call_scheme_supported(
+				scheme,
+				GLib::Variant::new_array(
+					GLib::VariantType::new_("{sv}"),
+					{}),
+				[=](GObject::Object, Gio::AsyncResult res) mutable {
+					const auto result
+						= interface.call_scheme_supported_finish(res);
+
+					if (!result || !std::get<1>(*result)) {
+						fail();
+						return;
+					}
+
+					callback(fail);
+				});
+		});
 }
 
 } // namespace
@@ -712,11 +764,10 @@ void start() {
 	GLib::set_prgname(cExeName().toStdString());
 	GLib::set_application_name(AppName.data());
 
-	Webview::WebKitGTK::SetSocketPath(u"%1/%2-%3-webview-%4"_q.arg(
+	Webview::WebKitGTK::SetSocketPath(u"%1/%2-%3-webview-{}"_q.arg(
 		QDir::tempPath(),
 		HashForSocketPath(),
-		u"TD"_q,//QCoreApplication::applicationName(), - make path smaller.
-		u"%1"_q).toStdString());
+		u"TD"_q).toStdString());
 
 	InstallLauncher();
 }
@@ -760,9 +811,23 @@ bool OpenSystemSettings(SystemSettingsType type) {
 		add("pavucontrol");
 		add("alsamixergui");
 		return ranges::any_of(options, [](const Command &command) {
-			return QProcess::startDetached(
-				command.command,
-				command.arguments);
+			QProcess process;
+			if (KSandbox::isInside()) {
+				process.setProgram("which");
+				process.setArguments({command.command});
+				KSandbox::startHostProcess(process);
+				process.waitForFinished();
+				if (process.exitStatus() != QProcess::NormalExit
+						|| process.exitCode() != 0) {
+					return false;
+				}
+			}
+			process.setProgram(command.command);
+			process.setArguments(command.arguments);
+			const auto hostContext = KSandbox::makeHostContext(process);
+			process.setProgram(hostContext.program);
+			process.setArguments(hostContext.arguments);
+			return process.startDetached();
 		});
 	}
 	return true;
@@ -784,6 +849,29 @@ QString ApplicationIconName() {
 		: QGuiApplication::desktopFileName().remove(
 		u"._"_q + Core::Launcher::Instance().instanceHash());
 	return Result;
+}
+
+void LaunchMaps(const Data::LocationPoint &point, Fn<void()> fail) {
+	const auto url = QUrl(
+		u"geo:%1,%2"_q.arg(point.latAsString(), point.lonAsString()));
+
+	AppInfoCheckScheme(url.scheme().toStdString(), [=](
+			Gio::AppInfo appInfo,
+			Fn<void()> fail) {
+		// TODO: use launch_uris_async once we can use GLib 2.60
+		if (!appInfo.launch_uris(
+				{ url.toString().toStdString() },
+				base::Platform::AppLaunchContext(),
+				nullptr)) {
+			fail();
+		}
+	}, [=] {
+		PortalCheckScheme(url.scheme().toStdString(), [=](Fn<void()> fail) {
+			if (!QDesktopServices::openUrl(url)) {
+				fail();
+			}
+		}, fail);
+	});
 }
 
 namespace ThirdParty {
@@ -842,8 +930,4 @@ bool linuxMoveFile(const char *from, const char *to) {
 	}
 
 	return true;
-}
-
-bool psLaunchMaps(const Data::LocationPoint &point) {
-	return false;
 }
